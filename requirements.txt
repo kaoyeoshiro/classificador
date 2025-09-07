@@ -1,10 +1,24 @@
-python-dotenv
-requests
-pandas
-pymupdf4llm
-openpyxl
-scikit-learn
-numpy
-sentence-transformers
+# Core dependencies
+python-dotenv>=1.1.0
+requests>=2.32.0
+pandas>=2.3.0
+openpyxl>=3.1.0
+
+# PDF processing
+pymupdf4llm>=0.0.27
+PyMuPDF>=1.26.0
+
+# Machine Learning and NLP
+scikit-learn>=1.7.0
+numpy>=2.3.0
+sentence-transformers>=5.1.0
+
+# OCR processing
 pytesseract
-Pillow
+Pillow>=10.0.0
+
+# Additional utilities (opcional - para barras de progresso futuras)
+# tqdm>=4.67.0
+
+# Data validation (opcional - para validação de dados futura)
+# pydantic>=1.10.0

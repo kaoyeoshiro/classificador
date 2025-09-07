@@ -1,0 +1,8 @@
+python-dotenv
+requests
+pandas
+pymupdf4llm
+openpyxl
+scikit-learn
+numpy
+sentence-transformers

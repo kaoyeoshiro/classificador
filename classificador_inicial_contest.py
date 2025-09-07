@@ -12,14 +12,14 @@ Tarefas:
 - Renomear PDFs seguindo a lógica: "<pct_conf>% - <nº processo> - <Tipo de Petição>.pdf"
 
 Requisitos:
-- pip install python-dotenv requests pandas pymupdf4llm
+- pip install python-dotenv requests pandas pymupdf4llm sentence-transformers scikit-learn openpyxl
   (pymupdf4llm puxa o PyMuPDF como dependência)
 
 .env esperado:
     OPENROUTER_API_KEY=sk-or-...
     OPENROUTER_MODEL=google/gemma-2-9b-it  # ou o que preferir
     OPENROUTER_BASE=https://openrouter.ai/api/v1  # opcional (padrão)
-    APP_TITLE=Classificador PGE-MS            # opcional (header x-title)
+    APP_TITLE=Classificador PGE-MS           # opcional (header x-title)
     APP_SITE_URL=https://pge.ms.gov.br/lab   # opcional (header HTTP-Referer)
 
 Observações:
@@ -38,10 +38,8 @@ import traceback
 import threading
 import queue
 from datetime import datetime
-import re
-from typing import List, Tuple
-from collections import defaultdict
 from typing import List, Tuple, Optional, Dict
+from collections import defaultdict
 
 import pandas as pd
 import requests
@@ -60,7 +58,14 @@ log = logging.getLogger("classificador")
 # =========================
 # ENV
 # =========================
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env2"))
+# Tenta carregar de .env2, se não existir, tenta .env
+dotenv_path_env2 = os.path.join(os.path.dirname(__file__), ".env2")
+dotenv_path_env = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(dotenv_path_env2):
+    load_dotenv(dotenv_path=dotenv_path_env2)
+else:
+    load_dotenv(dotenv_path=dotenv_path_env)
+
 
 OPENROUTER_BASE  = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 OPENROUTER_KEY   = os.getenv("OPENROUTER_API_KEY", "")
@@ -69,9 +74,9 @@ APP_TITLE        = os.getenv("APP_TITLE", "Classificador PGE-MS")
 APP_SITE_URL     = os.getenv("APP_SITE_URL", "")
 
 TIMEOUT_S        = 90
-MAX_INPUT_CHARS  = 24000      # segurança contra inputs gigantes
-SNIPPET_TOKENS   = 512        # limite de tokens (aprox. por palavras)
-ENABLE_RENAME    = True       # Se False, não renomeia arquivos (evita problemas de lock)
+MAX_INPUT_CHARS  = 24000     # segurança contra inputs gigantes
+SNIPPET_TOKENS   = 512       # limite de tokens (aprox. por palavras)
+ENABLE_RENAME    = True      # Se False, não renomeia arquivos (evita problemas de lock)
 
 # === SOLUÇÃO PARA WinError 32 "Arquivo em uso" ===
 # Se você continuar tendo problemas de renomeação:
@@ -114,23 +119,109 @@ def read_text_file(path: str) -> str:
 
 def read_pdf_text(path: str) -> str:
     """Extrai texto de PDF usando PyMuPDF via pymupdf4llm (markdown),
-    com fallback para PyMuPDF básico em texto puro.
+    com fallback para PyMuPDF básico em texto puro e OCR apenas para PDFs escaneados.
     """
+    # Tentativa 1: pymupdf4llm (melhor para PDFs com texto)
     try:
         import pymupdf4llm
         markdown_text = pymupdf4llm.to_markdown(path)
-        return normalize_text(markdown_text)
-    except Exception:
-        try:
-            import fitz
-            text_parts = []
-            with fitz.open(path) as doc:
-                for page in doc:
-                    text_parts.append(page.get_text("text"))
-            return normalize_text("\n\n".join(text_parts))
-        except Exception as e:
-            log.warning(f"Falha ao extrair texto do PDF {path}: {e}")
+        if markdown_text and markdown_text.strip():
+            log.debug(f"✅ pymupdf4llm extraiu {len(markdown_text)} caracteres de {path}")
+            return normalize_text(markdown_text)
+    except Exception as e:
+        log.debug(f"pymupdf4llm falhou para {path}: {e}")
+    
+    # Tentativa 2: PyMuPDF básico
+    try:
+        import fitz
+        text_parts = []
+        with fitz.open(path) as doc:
+            for page in doc:
+                page_text = page.get_text("text")
+                text_parts.append(page_text)
+        text = "\n\n".join(text_parts)
+        if text and text.strip():
+            log.debug(f"✅ PyMuPDF básico extraiu {len(text)} caracteres de {path}")
+            return normalize_text(text)
+    except Exception as e:
+        log.debug(f"PyMuPDF básico falhou para {path}: {e}")
+    
+    # Verificar se o PDF é digitalizado (escaneado) antes de usar OCR
+    if _is_scanned_pdf(path):
+        log.info(f"📄 PDF escaneado detectado: {path} - usando OCR")
+        return _extract_text_with_ocr(path)
+    else:
+        log.warning(f"⚠️ PDF não é escaneado e não tem texto extraível: {path}")
+        return ""
+
+
+def _is_scanned_pdf(path: str) -> bool:
+    """Verifica se o PDF é digitalizado (escaneado) baseado na quantidade de texto extraível"""
+    try:
+        import fitz
+        with fitz.open(path) as doc:
+            total_text_length = 0
+            total_pages = len(doc)
+            
+            # Verificar as primeiras 3 páginas para determinar se é escaneado
+            pages_to_check = min(3, total_pages)
+            
+            for page_num in range(pages_to_check):
+                page = doc[page_num]
+                page_text = page.get_text("text")
+                total_text_length += len(page_text.strip())
+            
+            # Se tem muito pouco texto nas primeiras páginas, provavelmente é escaneado
+            avg_text_per_page = total_text_length / pages_to_check
+            is_scanned = avg_text_per_page < 50  # Menos de 50 caracteres por página
+            
+            log.debug(f"PDF {path}: {total_text_length} chars em {pages_to_check} páginas (avg: {avg_text_per_page:.1f}) - Escaneado: {is_scanned}")
+            return is_scanned
+            
+    except Exception as e:
+        log.debug(f"Erro ao verificar se PDF é escaneado {path}: {e}")
+        return True  # Se não conseguir verificar, assume que é escaneado
+
+
+def _extract_text_with_ocr(path: str) -> str:
+    """Extrai texto usando OCR para PDFs escaneados"""
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+        import io
+        
+        text_parts = []
+        with fitz.open(path) as doc:
+            log.info(f"🔍 Aplicando OCR em {len(doc)} páginas de {path}")
+            
+            for page_num, page in enumerate(doc):
+                # Converter página para imagem com resolução otimizada
+                mat = fitz.Matrix(2.0, 2.0)  # Aumentar resolução para melhor OCR
+                pix = page.get_pixmap(matrix=mat)
+                img_data = pix.tobytes("png")
+                
+                # Usar OCR
+                image = Image.open(io.BytesIO(img_data))
+                page_text = pytesseract.image_to_string(image, lang='por')
+                text_parts.append(page_text)
+                
+                log.debug(f"OCR página {page_num + 1}: {len(page_text)} caracteres")
+        
+        text = "\n\n".join(text_parts)
+        if text and text.strip():
+            log.info(f"✅ OCR extraiu {len(text)} caracteres de {path}")
+            return normalize_text(text)
+        else:
+            log.warning(f"OCR não conseguiu extrair texto de {path}")
             return ""
+            
+    except ImportError:
+        log.warning("OCR não disponível (pytesseract/pillow não instalados)")
+        return ""
+    except Exception as e:
+        log.warning(f"OCR falhou para {path}: {e}")
+        return ""
 
 
 def read_file_content(path: str) -> str:
@@ -181,41 +272,39 @@ def build_unified_prompt(texto_norm: str) -> Dict:
     """
     Monta o payload para uma chamada única que classifica e extrai dados.
     """
-    system = (
-        "Você é um especialista em análise de documentos judiciais brasileiros.\n"
-        "Sua tarefa é:\n"
-        "1. Classificar o documento em 'inicial', 'contestacao' ou 'outra'.\n"
-        "2. SE for 'inicial' ou 'contestacao', extrair seus argumentos principais.\n\n"
-        "REGRAS DE CLASSIFICAÇÃO:\n"
-        "- 'inicial': A peça que propõe a ação. Sinais: 'propõe a presente ação', 'ajuíza a presente demanda'. NUNCA deve conter: 'já qualificado nos autos', 'réplica', 'impugnação à contestação'.\n"
-        "- 'contestacao': A defesa principal do réu. Sinais: 'apresentar contestação', 'oferece contestação'.\n"
-        "- 'outra': Qualquer outra peça processual. Em caso de dúvida, classifique como 'outra'.\n\n"
-        "REGRAS DE EXTRAÇÃO:\n"
-        "- Para 'inicial': Extraia 'pedidos', 'fundamentos_fato', e 'fundamentos_direito'.\n"
-        "- Para 'contestacao': Extraia 'preliminares', 'merito_fatos' (contra-argumentos aos fatos), e 'merito_direito' (contra-argumentos jurídicos).\n"
-        "- Se a classificação for 'outra', o campo 'extracao' DEVE ser nulo (`null`).\n\n"
-        "SAÍDA OBRIGATÓRIA (JSON):\n"
-        "Responda ESTRITAMENTE com um JSON no formato:\n"
-        "{\n"
-        "  \"classificacao\": {\n"
-        "    \"tipo_peticao\": \"inicial\" | \"contestacao\" | \"outra\",\n"
-        "    \"confianca\": 0.0-1.0,\n"
-        "    \"justificativa\": \"Cite o trecho exato que baseou a classificação.\"\n"
-        "  },\n"
-        "  \"extracao\": { \n"
-        "    \"pedidos\": [\"...\"],\n"
-        "    \"fundamentos_fato\": [\"...\"],
-"
-        "    \"fundamentos_direito\": [\"...\"]\n"
-        "  } | { \n"
-        "    \"preliminares\": [\"...\"],
-"
-        "    \"merito_fatos\": [\"...\"],
-"
-        "    \"merito_direito\": [\"...\"]\n"
-        "  } | null\n"
-        "}"
-    )
+    system = """Você é um especialista em análise de documentos judiciais brasileiros.
+Sua tarefa é:
+1. Classificar o documento em 'inicial', 'contestacao' ou 'outra'.
+2. SE for 'inicial' ou 'contestacao', extrair seus argumentos principais.
+
+REGRAS DE CLASSIFICAÇÃO:
+- 'inicial': A peça que propõe a ação. Sinais: 'propõe a presente ação', 'ajuíza a presente demanda'. NUNCA deve conter: 'já qualificado nos autos', 'réplica', 'impugnação à contestação'.
+- 'contestacao': A defesa principal do réu. Sinais: 'apresentar contestação', 'oferece contestação'.
+- 'outra': Qualquer outra peça processual. Em caso de dúvida, classifique como 'outra'.
+
+REGRAS DE EXTRAÇÃO:
+- Para 'inicial': Extraia 'pedidos', 'fundamentos_fato', e 'fundamentos_direito'.
+- Para 'contestacao': Extraia 'preliminares', 'merito_fatos' (contra-argumentos aos fatos), e 'merito_direito' (contra-argumentos jurídicos).
+- Se a classificação for 'outra', o campo 'extracao' DEVE ser nulo (`null`).
+
+SAÍDA OBRIGATÓRIA (JSON):
+Responda ESTRITAMENTE com um JSON no formato:
+{
+  "classificacao": {
+    "tipo_peticao": "inicial" | "contestacao" | "outra",
+    "confianca": 0.0-1.0,
+    "justificativa": "Cite o trecho exato que baseou a classificação."
+  },
+  "extracao": { 
+    "pedidos": ["..."],
+    "fundamentos_fato": ["..."],
+    "fundamentos_direito": ["..."]
+  } | { 
+    "preliminares": ["..."],
+    "merito_fatos": ["..."],
+    "merito_direito": ["..."]
+  } | null
+}"""
 
     user = (
         "Analise o documento abaixo, classificando-o e extraindo os dados relevantes. Retorne SOMENTE um JSON válido.\n\n"
@@ -233,24 +322,24 @@ def build_unified_prompt(texto_norm: str) -> Dict:
     }
 
 
-
 def build_extraction_prompt_inicial(texto_norm: str) -> Dict:
     """Prompt para extrair pedidos e fundamentos de petições iniciais."""
-    system = (
-        "Você é especialista em análise de petições iniciais brasileiras. "
-        "Sua tarefa é extrair de forma estruturada os PEDIDOS e FUNDAMENTOS da petição inicial.\n\n"
-        "INSTRUÇÕES:\n"
-        "1. PEDIDOS: Identifique todos os pedidos feitos pelo autor (principal, subsidiário, cautelar, etc.)\n"
-        "2. FUNDAMENTOS DE FATO: Extraia os principais fatos alegados pelo autor\n"
-        "3. FUNDAMENTOS DE DIREITO: Identifique as bases jurídicas invocadas (leis, jurisprudência, doutrina)\n\n"
-        "SAÍDA OBRIGATÓRIA:\n"
-        "Responda ESTRITAMENTE com um JSON no formato:\n"
-        "{\n"
-        "  \"pedidos\": [\"pedido1\", \"pedido2\", ...],\n"
-        "  \"fundamentos_fato\": [\"fato1\", \"fato2\", ...],\n"
-        "  \"fundamentos_direito\": [\"base_juridica1\", \"base_juridica2\", ...]\n"
-        "}\n"
-    )
+    system = """Você é especialista em análise de petições iniciais brasileiras.
+Sua tarefa é extrair de forma estruturada os PEDIDOS e FUNDAMENTOS da petição inicial.
+
+INSTRUÇÕES:
+1. PEDIDOS: Identifique todos os pedidos feitos pelo autor (principal, subsidiário, cautelar, etc.)
+2. FUNDAMENTOS DE FATO: Extraia os principais fatos alegados pelo autor
+3. FUNDAMENTOS DE DIREITO: Identifique as bases jurídicas invocadas (leis, jurisprudência, doutrina)
+
+SAÍDA OBRIGATÓRIA:
+Responda ESTRITAMENTE com um JSON no formato:
+{
+  "pedidos": ["pedido1", "pedido2", ...],
+  "fundamentos_fato": ["fato1", "fato2", ...],
+  "fundamentos_direito": ["base_juridica1", "base_juridica2", ...]
+}
+"""
     user = (
         "Extraia os pedidos e fundamentos da petição inicial abaixo:\n\n"
         f"=== PETIÇÃO INICIAL ===\n{texto_norm[:MAX_INPUT_CHARS]}"
@@ -268,23 +357,24 @@ def build_extraction_prompt_inicial(texto_norm: str) -> Dict:
 
 def build_extraction_prompt_contestacao(texto_norm: str) -> Dict:
     """Prompt para extrair argumentos de contestações."""
-    system = (
-        "Você é especialista em análise de contestações brasileiras. "
-        "Sua tarefa é extrair os ARGUMENTOS DE DEFESA utilizados pelo réu para impugnar a inicial.\n\n"
-        "INSTRUÇÕES:\n"
-        "1. PRELIMINARES: Argumentos processuais (incompetência, ilegitimidade, etc.)\n"
-        "2. MÉRITO - FATOS: Argumentos que contestam os fatos alegados na inicial\n"
-        "3. MÉRITO - DIREITO: Argumentos jurídicos contra os fundamentos da inicial\n"
-        "4. OUTROS: Demais argumentos defensivos\n\n"
-        "SAÍDA OBRIGATÓRIA:\n"
-        "Responda ESTRITAMENTE com um JSON no formato:\n"
-        "{\n"
-        "  \"preliminares\": [\"argumento1\", \"argumento2\", ...],\n"
-        "  \"merito_fatos\": [\"contra_fato1\", \"contra_fato2\", ...],\n"
-        "  \"merito_direito\": [\"contra_direito1\", \"contra_direito2\", ...],\n"
-        "  \"outros_argumentos\": [\"argumento1\", \"argumento2\", ...]\n"
-        "}\n"
-    )
+    system = """Você é especialista em análise de contestações brasileiras.
+Sua tarefa é extrair os ARGUMENTOS DE DEFESA utilizados pelo réu para impugnar a inicial.
+
+INSTRUÇÕES:
+1. PRELIMINARES: Argumentos processuais (incompetência, ilegitimidade, etc.)
+2. MÉRITO - FATOS: Argumentos que contestam os fatos alegados na inicial
+3. MÉRITO - DIREITO: Argumentos jurídicos contra os fundamentos da inicial
+4. OUTROS: Demais argumentos defensivos
+
+SAÍDA OBRIGATÓRIA:
+Responda ESTRITAMENTE com um JSON no formato:
+{
+  "preliminares": ["argumento1", "argumento2", ...],
+  "merito_fatos": ["contra_fato1", "contra_fato2", ...],
+  "merito_direito": ["contra_direito1", "contra_direito2", ...],
+  "outros_argumentos": ["argumento1", "argumento2", ...]
+}
+"""
     user = (
         "Extraia os argumentos de defesa da contestação abaixo:\n\n"
         f"=== CONTESTAÇÃO ===\n{texto_norm[:MAX_INPUT_CHARS]}"
@@ -304,62 +394,62 @@ def build_mapping_prompt(inicial_data: Dict, contestacao_data: Dict) -> Dict:
     """
     Constrói o prompt para o LLM mapear argumentos da inicial com a contestação.
     """
-    system = (
-        "Você é um assistente jurídico especialista em análise dialética de processos. "
-        "Sua tarefa é mapear os argumentos de uma petição inicial com seus respectivos contra-argumentos de uma contestação.\n\n"
-        "REGRAS:\n"
-        "1. Para cada argumento da inicial (fato ou direito), encontre o contra-argumento mais direto na contestação.\n"
-        "2. Se um argumento da inicial não for diretamente rebatido, o mapeamento para ele deve ser nulo (`null`).\n"
-        "3. Um mesmo contra-argumento da contestação PODE ser usado para rebater múltiplos argumentos da inicial, se aplicável.\n"
-        "4. Foque na refutação lógica, não apenas em palavras-chave semelhantes.\n\n"
-        "SAÍDA OBRIGATÓRIA (JSON):\n"
-        "Retorne uma lista de mapeamentos no formato:\n"
-        "[\n"
-        "  {\n"
-        "    \"argumento_inicial\": { \"id\": \"fato_1\", \"texto\": \"...\" },\n"
-        "    \"contra_argumento_contestacao\": { \"id\": \"contrafato_3\", \"texto\": \"...\" },\n"
-        "    \"justificativa_mapeamento\": \"O réu nega o fato X afirmando que Y ocorreu.\",\n"
-        "    \"score_confianca\": 0.9\n"
-        "  },\n"
-        "  {\n"
-        "    \"argumento_inicial\": { \"id\": \"direito_2\", \"texto\": \"...\" },\n"
-        "    \"contra_argumento_contestacao\": null,\n"
-        "    \"justificativa_mapeamento\": \"A contestação não aborda diretamente a tese jurídica do art. 261 do CTB.\",\n"
-        "    \"score_confianca\": 0.95\n"
-        "  }\n"
-        "]"
-    )
+    system = """Você é um assistente jurídico especialista em análise dialética de processos.
+Sua tarefa é mapear os argumentos de uma petição inicial com seus respectivos contra-argumentos de uma contestação.
+
+REGRAS:
+1. Para cada argumento da inicial (fato ou direito), encontre o contra-argumento mais direto na contestação.
+2. Se um argumento da inicial não for diretamente rebatido, o mapeamento para ele deve ser nulo (`null`).
+3. Um mesmo contra-argumento da contestação PODE ser usado para rebater múltiplos argumentos da inicial, se aplicável.
+4. Foque na refutação lógica, não apenas em palavras-chave semelhantes.
+
+SAÍDA OBRIGATÓRIA (JSON):
+Retorne uma lista de mapeamentos no formato:
+[
+  {
+    "argumento_inicial": { "id": "fato_1", "texto": "..." },
+    "contra_argumento_contestacao": { "id": "contrafato_3", "texto": "..." },
+    "justificativa_mapeamento": "O réu nega o fato X afirmando que Y ocorreu.",
+    "score_confianca": 0.9
+  },
+  {
+    "argumento_inicial": { "id": "direito_2", "texto": "..." },
+    "contra_argumento_contestacao": null,
+    "justificativa_mapeamento": "A contestação não aborda diretamente a tese jurídica do art. 261 do CTB.",
+    "score_confianca": 0.95
+  }
+]"""
 
     # Constrói a lista de argumentos da inicial de forma numerada
     inicial_args_str = ""
     i_fato_count = 0
     for i, fato in enumerate(inicial_data.get("fundamentos_fato", [])):
         texto = fato.get("texto", str(fato))
-        inicial_args_str += f"  - fato_{i+1}: \\\"{texto}\\\"\n"
+        inicial_args_str += f'  - fato_{i+1}: "{texto}"\n'
         i_fato_count = i + 1
     
     for i, direito in enumerate(inicial_data.get("fundamentos_direito", [])):
         texto = direito.get("texto", str(direito))
-        inicial_args_str += f"  - direito_{i+1}: \\\"{texto}\\\"\n"
+        inicial_args_str += f'  - direito_{i+1}: "{texto}"\n'
 
     # Constrói a lista de argumentos da contestação
     contestacao_args_str = ""
     c_prelim_count = 0
     for i, prelim in enumerate(contestacao_data.get("preliminares", [])):
         texto = prelim.get("texto", str(prelim))
-        contestacao_args_str += f"  - preliminar_{i+1}: \\\"{texto}\\\"\n"
+        contestacao_args_str += f'  - preliminar_{i+1}: "{texto}"\n'
         c_prelim_count = i + 1
 
     c_fato_count = 0
     for i, fato in enumerate(contestacao_data.get("merito_fatos", [])):
         texto = fato.get("texto", str(fato))
-        contestacao_args_str += f"  - contrafato_{i+1}: \\\"{texto}\\\"\n"
+        contestacao_args_str += f'  - contrafato_{i+1}: "{texto}"\n'
         c_fato_count = i + 1
 
     c_direito_count = 0
     for i, direito in enumerate(contestacao_data.get("merito_direito", [])):
         texto = direito.get("texto", str(direito))
-        contestacao_args_str += f"  - contradireito_{i+1}: \\\"{texto}\\\"\n"
+        contestacao_args_str += f'  - contradireito_{i+1}: "{texto}"\n'
         c_direito_count = i + 1
 
     user = (
@@ -588,8 +678,8 @@ class SemanticAnalyzer:
             # Lista de modelos alternativos (do mais pesado para o mais leve)
             models_to_try = [
                 'paraphrase-multilingual-MiniLM-L12-v2',  # Ideal para português
-                'all-MiniLM-L6-v2',                       # Modelo menor, mais rápido
-                'all-MiniLM-L12-v2'                       # Fallback médio
+                'all-MiniLM-L6-v2',                        # Modelo menor, mais rápido
+                'all-MiniLM-L12-v2'                        # Fallback médio
             ]
             
             self.model = None
@@ -851,7 +941,7 @@ class DataAnalyzer:
                         
                         # Encontra referências normativas relacionadas
                         related_norms = [ref for ref in normative_refs 
-                                       if self._text_overlaps(item, ref.text, texto_completo)]
+                                         if self._text_overlaps(item, ref.text, texto_completo)]
                         
                         enhanced_item = {
                             "texto": item,
@@ -1678,21 +1768,21 @@ class DataAnalyzer:
                             "autor": {
                                 "cluster_id": self._find_cluster_for_text(p["autor"]["texto"]),
                                 "texto": p["autor"]["texto"],
-                                "doc": p["autor"]["doc"],
-                                "offset": p["autor"]["offset"],
-                                "normas": p["autor"]["normas_relacionadas"]
+                                "doc": p["autor"].get("doc", ""),
+                                "offset": p["autor"].get("offset", (0,0)),
+                                "normas": p["autor"].get("normas_relacionadas", [])
                             },
                             "reu": {
                                 "cluster_id": self._find_cluster_for_text(p["reu"]["texto"]),
                                 "texto": p["reu"]["texto"],
-                                "doc": p["reu"]["doc"],
-                                "offset": p["reu"]["offset"],
-                                "normas": p["reu"]["normas_relacionadas"]
+                                "doc": p["reu"].get("doc", ""),
+                                "offset": p["reu"].get("offset", (0,0)),
+                                "normas": p["reu"].get("normas_relacionadas", [])
                             }
                         },
                         "score": p["score"],
                         "confianca": p["confianca"],
-                        "normas_relacionadas": p["normas_relacionadas"],
+                        "normas_relacionadas": p.get("normas_relacionadas", []),
                         "trace": p["trace"],
                         "validacao_temporal": self._validate_temporal_consistency(p)
                     }
@@ -2156,9 +2246,9 @@ class DataAnalyzer:
             total_docs = len(self.iniciais_data) + len(self.contestacoes_data)
             if total_docs > 0:
                 log.info(f"🔄 Backup restaurado! {total_docs} documentos recuperados")
-                log.info(f"   • Petições iniciais: {len(self.iniciais_data)}")
-                log.info(f"   • Contestações: {len(self.contestacoes_data)}")
-                log.info(f"   • Pares mapeados: {len(self.argument_pairs)}")
+                log.info(f"    • Petições iniciais: {len(self.iniciais_data)}")
+                log.info(f"    • Contestações: {len(self.contestacoes_data)}")
+                log.info(f"    • Pares mapeados: {len(self.argument_pairs)}")
                 return True
             else:
                 log.info("🆕 Backup vazio encontrado, iniciando nova sessão")
@@ -2323,11 +2413,11 @@ def safe_rename(path: str, new_basename: str, max_retries: int = 6) -> str:
                         log.info(f"🔒 Arquivo em uso. Aguardando {wait_time}s...")
                     elif attempt == 1:
                         wait_time = 2
-                        log.info(f"🔄 Forçando liberação de recursos...")
+                        log.info("🔄 Forçando liberação de recursos...")
                         force_file_release(source)
                     elif attempt == 2:
                         wait_time = 3
-                        log.info(f"⏳ Aguardando acesso ao arquivo...")
+                        log.info("⏳ Aguardando acesso ao arquivo...")
                         if not wait_for_file_access(source, 3):
                             log.warning("⚠️ Arquivo ainda bloqueado")
                     elif attempt == 3:
@@ -2352,10 +2442,10 @@ def safe_rename(path: str, new_basename: str, max_retries: int = 6) -> str:
         # Todas as tentativas falharam
         log.error(f"💥 FALHA: Impossível renomear {original_name} após {max_retries} tentativas")
         log.error("🔧 SOLUÇÕES:")
-        log.error("   • Feche visualizadores de PDF (Adobe Reader, Edge, Chrome)")
-        log.error("   • Feche Windows Explorer na pasta")
-        log.error("   • Aguarde alguns minutos")
-        log.error("   • Temporariamente: pause antivírus/indexação")
+        log.error("    • Feche visualizadores de PDF (Adobe Reader, Edge, Chrome)")
+        log.error("    • Feche Windows Explorer na pasta")
+        log.error("    • Aguarde alguns minutos")
+        log.error("    • Temporariamente: pause antivírus/indexação")
         return source
 
     # Primeira tentativa: nome desejado
@@ -2418,11 +2508,12 @@ def process_one(path: str, log_cb=None) -> Dict[str, Optional[str]]:
     numero_processo = extract_process_number_from_name(base_name)
 
     if sem_conteudo:
-        _log("⚠️ Arquivo vazio ou sem texto extraível — marcando como 'Outra petição' com confiança 0.00")
+        _log("⚠️ Arquivo vazio ou sem texto extraível — marcando como 'outra' com confiança 0.00")
         snippet = ""
-        tipo = "Outra petição"
+        tipo = "outra"
         conf = 0.0
-        novo_basename = f"0% - {numero_processo} - {tipo}{os.path.splitext(path)[1]}"
+        # CORREÇÃO: Padroniza o nome para minúsculas para consistência
+        novo_basename = f"0% - {numero_processo} - {tipo.replace(' ', '_')}.pdf"
         
         if ENABLE_RENAME:
             _log(f"→ Renomeando para: {novo_basename}")
@@ -2445,20 +2536,27 @@ def process_one(path: str, log_cb=None) -> Dict[str, Optional[str]]:
     # Chama LLM (OpenRouter)
     _log("→ Chamando OpenRouter LLM…")
     try:
-        res = call_openrouter(texto_norm)
-        tipo = res["tipo"]
-        conf = float(res.get("confianca", 0.5))
+        # CORREÇÃO: Usa o prompt unificado e extrai os dados corretamente da resposta aninhada
+        payload = build_unified_prompt(texto_norm)
+        res = call_openrouter(payload)
+        classificacao = res.get("classificacao", {})
+        tipo = classificacao.get("tipo_peticao", "outra")
+        conf = float(classificacao.get("confianca", 0.5))
+        extracao = res.get("extracao") # Guardado para uso futuro no process_batch
     except Exception as e:
-        _log(f"× Falha na LLM: {e} — marcando como 'Outra petição' (conf. 0.50)")
-        tipo = "Outra petição"
+        _log(f"× Falha na LLM: {e} — marcando como 'outra' (conf. 0.50)")
+        tipo = "outra"
         conf = 0.5
+        extracao = None
 
     # Renomeia o arquivo conforme confiança e rótulo (se habilitado)
     confianca_pct = max(0, min(100, int(round(conf * 100))))
-    novo_basename = f"{confianca_pct}% - {numero_processo} - {tipo}{os.path.splitext(path)[1]}"
+    # CORREÇÃO: Padroniza o nome para minúsculas e sem espaços para consistência
+    tipo_fn = tipo.lower().replace(" ", "_")
+    novo_basename = f"{confianca_pct}% - {numero_processo} - {tipo_fn}" # extensão será adicionada por safe_rename
     
     if ENABLE_RENAME:
-        _log(f"→ Renomeando para: {novo_basename}")
+        _log(f"→ Renomeando para: {novo_basename}{os.path.splitext(path)[1]}")
         novo_caminho = safe_rename(path, novo_basename)
     else:
         _log(f"→ Renomeação desabilitada, mantendo: {os.path.basename(path)}")
@@ -2470,6 +2568,8 @@ def process_one(path: str, log_cb=None) -> Dict[str, Optional[str]]:
         "Transcrição (512 tokens)": transcricao_512,
         "Arquivo (novo)": os.path.basename(novo_caminho),
         "_texto_normalizado": texto_norm,  # Para uso interno na extração
+        "_tipo_peticao_llm": tipo, # Passa o tipo para o process_batch
+        "_extracao_llm": extracao, # Passa os dados extraídos
     }
 
 
@@ -2506,62 +2606,42 @@ def process_batch(input_dir: str, output_dir: str, recursive: bool, log_cb=None,
             rows.append(res)
             
             # Inicializa variáveis para uso posterior
-            tipo_peticao = ""
-            texto_norm = ""
+            tipo_peticao = res.get("_tipo_peticao_llm", "").lower()
+            texto_norm = res.get("_texto_normalizado", "")
+            extracao_data = res.get("_extracao_llm")
             
             # Extração de dados para análise (se analyzer foi fornecido)
-            if analyzer and res.get("Tipo de Petição") and res.get("_texto_normalizado"):
-                tipo_peticao = res["Tipo de Petição"].lower()
-                texto_norm = res["_texto_normalizado"]
-                _log(f"[{i}/{total}] Tipo classificado: '{res['Tipo de Petição']}'")
+            if analyzer and tipo_peticao and texto_norm and extracao_data:
+                _log(f"[{i}/{total}] Tipo classificado: '{tipo_peticao}'")
                 
-                # Só processa se há texto para extrair
-                if texto_norm.strip():
-                    try:
-                        if "inicial" in tipo_peticao or "petição inicial" in tipo_peticao:
-                            _log(f"[{i}/{total}] Extraindo dados da petição inicial...")
-                            payload = build_extraction_prompt_inicial(texto_norm)
-                            extraction_data = call_openrouter_extraction(payload)
-                            analyzer.add_inicial_data(os.path.basename(f), extraction_data, texto_norm)
-                            pedidos_count = len(extraction_data.get('pedidos', []))
-                            fatos_count = len(extraction_data.get('fundamentos_fato', []))
-                            direito_count = len(extraction_data.get('fundamentos_direito', []))
-                            _log(f"[{i}/{total}] ✅ Inicial extraída: {pedidos_count} pedidos, {fatos_count} fatos, {direito_count} fundamentos jurídicos")
-                            
-                            # Estatísticas acumuladas
-                            total_iniciais = len(analyzer.iniciais_data)
-                            total_contestacoes = len(analyzer.contestacoes_data)
-                            _log(f"[{i}/{total}] 📊 ACUMULADO: {total_iniciais} iniciais, {total_contestacoes} contestações processadas")
-                            
-                        elif "contestação" in tipo_peticao or "contestacao" in tipo_peticao:
-                            _log(f"[{i}/{total}] Extraindo dados da contestação...")
-                            payload = build_extraction_prompt_contestacao(texto_norm)
-                            extraction_data = call_openrouter_extraction(payload)
-                            analyzer.add_contestacao_data(os.path.basename(f), extraction_data, texto_norm)
-                            preliminares_count = len(extraction_data.get('preliminares', []))
-                            merito_fatos_count = len(extraction_data.get('merito_fatos', []))
-                            merito_direito_count = len(extraction_data.get('merito_direito', []))
-                            outros_count = len(extraction_data.get('outros_argumentos', []))
-                            total_args = preliminares_count + merito_fatos_count + merito_direito_count + outros_count
-                            _log(f"[{i}/{total}] ✅ Contestação extraída: {total_args} argumentos ({preliminares_count} prelim., {merito_fatos_count} fatos, {merito_direito_count} direito, {outros_count} outros)")
-                            
-                            # Estatísticas acumuladas
-                            total_contestacoes = len(analyzer.contestacoes_data)
-                            total_mapeamentos = len(analyzer.argument_pairs)
-                            _log(f"[{i}/{total}] 📊 ACUMULADO: {total_contestacoes} contestações, {total_mapeamentos} mapeamentos autor-réu")
-                            
-                    except Exception as extract_error:
-                        _log(f"[{i}/{total}] Erro na extração de dados: {extract_error}")
-                        if log_cb:
-                            log_cb(f"Detalhes do erro: {traceback.format_exc()}")
-            
-            # Log de progresso da coleta de dados (sem gerar relatórios)
-            if analyzer:
-                total_docs = len(analyzer.iniciais_data) + len(analyzer.contestacoes_data)
-                
-                # Mostra progresso a cada 10 documentos ou quando encontra dados relevantes
-                if (i % 10 == 0 and total_docs > 0) or ("inicial" in tipo_peticao or "contestação" in tipo_peticao):
-                    _log(f"[{i}/{total}] 📊 Dados coletados até agora: {len(analyzer.iniciais_data)} iniciais, {len(analyzer.contestacoes_data)} contestações")
+                try:
+                    if "inicial" in tipo_peticao:
+                        _log(f"[{i}/{total}] Adicionando dados da petição inicial para análise...")
+                        analyzer.add_inicial_data(res["Arquivo (novo)"], extracao_data, texto_norm)
+                        pedidos_count = len(extracao_data.get('pedidos', []))
+                        fatos_count = len(extracao_data.get('fundamentos_fato', []))
+                        direito_count = len(extracao_data.get('fundamentos_direito', []))
+                        _log(f"[{i}/{total}] ✅ Inicial analisada: {pedidos_count} pedidos, {fatos_count} fatos, {direito_count} fund. jurídicos")
+                        
+                    elif "contestacao" in tipo_peticao:
+                        _log(f"[{i}/{total}] Adicionando dados da contestação para análise...")
+                        analyzer.add_contestacao_data(res["Arquivo (novo)"], extracao_data, texto_norm)
+                        preliminares_count = len(extracao_data.get('preliminares', []))
+                        merito_fatos_count = len(extracao_data.get('merito_fatos', []))
+                        merito_direito_count = len(extracao_data.get('merito_direito', []))
+                        total_args = preliminares_count + merito_fatos_count + merito_direito_count
+                        _log(f"[{i}/{total}] ✅ Contestação analisada: {total_args} argumentos")
+                    
+                    # Log de progresso da coleta
+                    total_iniciais = len(analyzer.iniciais_data)
+                    total_contestacoes = len(analyzer.contestacoes_data)
+                    total_mapeamentos = len(analyzer.argument_pairs)
+                    _log(f"[{i}/{total}] 📊 ACUMULADO: {total_iniciais} iniciais, {total_contestacoes} contestações, {total_mapeamentos} mapeamentos.")
+
+                except Exception as extract_error:
+                    _log(f"[{i}/{total}] Erro na fase de análise de dados: {extract_error}")
+                    if log_cb:
+                        log_cb(f"Detalhes do erro: {traceback.format_exc()}")
             
             _log(f"[{i}/{total}] OK.")
         except Exception as e:
@@ -2586,7 +2666,9 @@ def process_batch(input_dir: str, output_dir: str, recursive: bool, log_cb=None,
     # Salva Excel e JSON
     df.to_excel(saida_xlsx, index=False)
     with open(saida_json, "w", encoding="utf-8") as jf:
-        json.dump(rows, jf, ensure_ascii=False, indent=2)
+        # Remove colunas internas antes de salvar o JSON final
+        rows_cleaned = [{k: v for k, v in row.items() if not k.startswith('_')} for row in rows]
+        json.dump(rows_cleaned, jf, ensure_ascii=False, indent=2)
 
     tipos = df["Tipo de Petição"].value_counts().to_dict()
     _log("=== CONCLUÍDO ===")
@@ -2724,8 +2806,10 @@ def generate_reports(analyzer: DataAnalyzer, output_dir: str, real_time=True):
     
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         # Aba 1: Resumo Executivo
-        resumo_data = [relatorio_json["resumo_executivo"]]
-        resumo_df = pd.DataFrame(resumo_data)
+        # CORREÇÃO: A chave 'resumo_executivo' não existe. Usando 'resumo_geral' e 'avaliacao'.
+        resumo_geral_df = pd.DataFrame([semantic_analysis["resumo_geral"]])
+        avaliacao_df = pd.DataFrame([relatorio_json["avaliacao"]])
+        resumo_df = pd.concat([resumo_geral_df, avaliacao_df], axis=1)
         resumo_df.to_excel(writer, sheet_name='Resumo_Executivo', index=False)
         
         # Aba 2: Clusters Semânticos - Pedidos
@@ -2766,38 +2850,21 @@ def generate_reports(analyzer: DataAnalyzer, output_dir: str, real_time=True):
         
         # Aba 4: Mapeamento Autor-Réu
         mapeamento_data = []
-        if analyzer.argument_pairs:
-            for pair in analyzer.argument_pairs:
-                for pedido_vs_prelim in pair["pares"]["pedidos_vs_preliminares"]:
-                    mapeamento_data.append({
-                        "Processo": pair["processo"],
-                        "Tipo": "Pedido vs Preliminar",
-                        "Argumento_Autor": pedido_vs_prelim["pedido_autor"],
-                        "Resposta_Reu": pedido_vs_prelim["resposta_reu"],
-                        "Similaridade": f"{pedido_vs_prelim['similaridade']:.2f}"
-                    })
-                
-                for fato_vs_contra in pair["pares"]["fatos_vs_contrafatos"]:
-                    mapeamento_data.append({
-                        "Processo": pair["processo"],
-                        "Tipo": "Fato vs Contrafato",
-                        "Argumento_Autor": fato_vs_contra["fato_autor"],
-                        "Resposta_Reu": fato_vs_contra["contrafato_reu"],
-                        "Similaridade": f"{fato_vs_contra['similaridade']:.2f}"
-                    })
-                
-                for direito_vs_contra in pair["pares"]["direito_vs_contradireito"]:
-                    mapeamento_data.append({
-                        "Processo": pair["processo"],
-                        "Tipo": "Direito vs Contradireito",
-                        "Argumento_Autor": direito_vs_contra["direito_autor"],
-                        "Resposta_Reu": direito_vs_contra["contradireito_reu"],
-                        "Similaridade": f"{direito_vs_contra['similaridade']:.2f}"
-                    })
+        # CORREÇÃO: Acessa a estrutura de dados correta de 'mapeamentos'
+        if relatorio_json["mapeamentos"]:
+            for mapping in relatorio_json["mapeamentos"]:
+                mapeamento_data.append({
+                    "Processo": mapping["processo"],
+                    "Tipo": mapping["tipo_mapeamento"],
+                    "Argumento_Autor": mapping["par"]["autor"]["texto"],
+                    "Resposta_Reu": mapping["par"]["reu"]["texto"],
+                    "Score": f"{mapping['score']:.2f}",
+                    "Confianca": mapping["confianca"]
+                })
         
         # Sempre cria a aba, mesmo se vazia
         if not mapeamento_data:
-            mapeamento_data = [{"Processo": "N/A", "Tipo": "Nenhum mapeamento encontrado", "Argumento_Autor": "N/A", "Resposta_Reu": "N/A", "Similaridade": "0.00"}]
+            mapeamento_data = [{"Processo": "N/A", "Tipo": "Nenhum mapeamento encontrado", "Argumento_Autor": "N/A", "Resposta_Reu": "N/A", "Score": "0.00", "Confianca": "N/A"}]
         pd.DataFrame(mapeamento_data).to_excel(writer, sheet_name='Mapeamento_Autor_Reu', index=False)
         
         # Aba 5: Padrões de Defesa
@@ -2905,10 +2972,11 @@ def generate_reports(analyzer: DataAnalyzer, output_dir: str, real_time=True):
             for item in analyzer.iniciais_data:
                 row = {"arquivo": item["arquivo"], "timestamp": item["timestamp"]}
                 data = item["data"]
+                # CORREÇÃO: Extrai texto dos objetos com rastreabilidade
                 row.update({
-                    "pedidos": "; ".join(data.get("pedidos", [])),
-                    "fundamentos_fato": "; ".join(data.get("fundamentos_fato", [])),
-                    "fundamentos_direito": "; ".join(data.get("fundamentos_direito", []))
+                    "pedidos": "; ".join([p.get("texto", str(p)) for p in data.get("pedidos", [])]),
+                    "fundamentos_fato": "; ".join([f.get("texto", str(f)) for f in data.get("fundamentos_fato", [])]),
+                    "fundamentos_direito": "; ".join([d.get("texto", str(d)) for d in data.get("fundamentos_direito", [])])
                 })
                 iniciais_flat.append(row)
         
@@ -2925,11 +2993,12 @@ def generate_reports(analyzer: DataAnalyzer, output_dir: str, real_time=True):
             for item in analyzer.contestacoes_data:
                 row = {"arquivo": item["arquivo"], "timestamp": item["timestamp"]}
                 data = item["data"]
+                # CORREÇÃO: Extrai texto dos objetos com rastreabilidade
                 row.update({
-                    "preliminares": "; ".join(data.get("preliminares", [])),
-                    "merito_fatos": "; ".join(data.get("merito_fatos", [])),
-                    "merito_direito": "; ".join(data.get("merito_direito", [])),
-                    "outros_argumentos": "; ".join(data.get("outros_argumentos", []))
+                    "preliminares": "; ".join([p.get("texto", str(p)) for p in data.get("preliminares", [])]),
+                    "merito_fatos": "; ".join([f.get("texto", str(f)) for f in data.get("merito_fatos", [])]),
+                    "merito_direito": "; ".join([d.get("texto", str(d)) for d in data.get("merito_direito", [])]),
+                    "outros_argumentos": "; ".join([o.get("texto", str(o)) for o in data.get("outros_argumentos", [])])
                 })
                 contestacoes_flat.append(row)
         
@@ -2941,8 +3010,6 @@ def generate_reports(analyzer: DataAnalyzer, output_dir: str, real_time=True):
         contestacoes_df.to_excel(writer, sheet_name='Dados_Contestacoes', index=False)
     
     return json_path, excel_path
-
-
 
 
 class App(tk.Tk):
@@ -2985,7 +3052,7 @@ class App(tk.Tk):
         ttk.Button(row1, text="Selecionar…", command=self.choose_input).pack(side="left")
 
         row2 = ttk.Frame(io_frame); row2.pack(fill="x", padx=8, pady=5)
-        ttk.Label(row2, text="Pasta de SAÍDA:   ").pack(side="left")
+        ttk.Label(row2, text="Pasta de SAÍDA:    ").pack(side="left")
         ttk.Entry(row2, textvariable=self.output_dir, width=80).pack(side="left", padx=5)
         ttk.Button(row2, text="Selecionar…", command=self.choose_output).pack(side="left")
 
@@ -3042,6 +3109,7 @@ class App(tk.Tk):
         path = filedialog.askdirectory(title="Selecione a PASTA DE SAÍDA (para salvar o Excel/JSON)", mustexist=True)
         if path:
             self.output_dir.set(path)
+            self.analyzer.output_dir = path # Atualiza o diretório no analyzer
 
     def append_log(self, msg: str):
         self.text.configure(state="normal")
@@ -3066,45 +3134,30 @@ class App(tk.Tk):
     def generate_reports(self):
         """Gera relatórios de análise com os dados coletados até o momento."""
         try:
-            # Verifica se há dados para gerar relatório
             total_docs = len(self.analyzer.iniciais_data) + len(self.analyzer.contestacoes_data)
-            
-            # Debug - mostra estado atual do analyzer
-            self.append_log(f"DEBUG - Estado do analyzer:")
-            self.append_log(f"  Iniciais coletadas: {len(self.analyzer.iniciais_data)}")
-            self.append_log(f"  Contestações coletadas: {len(self.analyzer.contestacoes_data)}")
-            
-            if len(self.analyzer.iniciais_data) > 0:
-                self.append_log(f"  Primeira inicial: {list(self.analyzer.iniciais_data[0]['data'].keys())}")
-            if len(self.analyzer.contestacoes_data) > 0:
-                self.append_log(f"  Primeira contestação: {list(self.analyzer.contestacoes_data[0]['data'].keys())}")
-            
-            # Conta elementos únicos da nova estrutura
-            total_pedidos = sum(len(inicial['data'].get('pedidos', [])) for inicial in self.analyzer.iniciais_data)
-            total_contestacoes_args = sum(len(contest['data'].get('preliminares', [])) + 
-                                        len(contest['data'].get('merito_fatos', [])) + 
-                                        len(contest['data'].get('merito_direito', [])) 
-                                        for contest in self.analyzer.contestacoes_data)
-            total_mapeamentos = len(self.analyzer.argument_pairs)
-            
-            self.append_log(f"  Total de pedidos extraídos: {total_pedidos}")
-            self.append_log(f"  Total argumentos de contestação: {total_contestacoes_args}")
-            self.append_log(f"  Total de mapeamentos autor-réu: {total_mapeamentos}")
-            self.append_log(f"  Dados com rastreabilidade completa: ✅")
             
             if total_docs == 0:
                 messagebox.showinfo("Sem dados", "Nenhum documento foi analisado ainda.\nExecute a classificação primeiro.")
                 return
             
-            # Solicita diretório de saída para relatórios
             if not self.output_dir.get() or not os.path.isdir(self.output_dir.get()):
                 messagebox.showwarning("Ops", "Selecione uma PASTA DE SAÍDA válida primeiro.")
                 return
             
-            # Gera relatórios
             try:
                 json_path, excel_path = generate_reports(self.analyzer, self.output_dir.get(), real_time=False)
                 
+                # CORREÇÃO: Calcula as variáveis que estavam faltando
+                total_pedidos = sum(len(inicial['data'].get('pedidos', [])) for inicial in self.analyzer.iniciais_data)
+                total_fund_fato = sum(len(inicial['data'].get('fundamentos_fato', [])) for inicial in self.analyzer.iniciais_data)
+                total_fund_direito = sum(len(inicial['data'].get('fundamentos_direito', [])) for inicial in self.analyzer.iniciais_data)
+                total_argumentos = sum(
+                    len(c['data'].get('preliminares', [])) + 
+                    len(c['data'].get('merito_fatos', [])) + 
+                    len(c['data'].get('merito_direito', [])) 
+                    for c in self.analyzer.contestacoes_data
+                )
+
                 msg = (f"Relatórios gerados com sucesso!\n\n"
                        f"Documentos analisados: {total_docs}\n"
                        f"Petições iniciais: {len(self.analyzer.iniciais_data)}\n"
@@ -3132,23 +3185,9 @@ class App(tk.Tk):
     def interrupt_processing(self):
         """Interrompe o processamento em andamento."""
         if self.is_processing:
-            result = messagebox.askyesnocancel(
-                "Interromper Processamento",
-                "Deseja realmente interromper o processamento?\n\n"
-                "• Sim: Interrompe e mantém relatórios gerados até agora\n"
-                "• Não: Interrompe e descarta relatórios\n"
-                "• Cancelar: Continua processamento"
-            )
-            
-            if result is True:  # Sim - interromper e manter relatórios
+            if messagebox.askyesno("Interromper", "Deseja realmente interromper o processamento?"):
                 self.should_interrupt = True
-                self.append_log("Interrupção solicitada - mantendo relatórios...")
-            elif result is False:  # Não - interromper e descartar
-                self.should_interrupt = True
-                # Limpa os dados do analyzer
-                self.analyzer = DataAnalyzer(output_dir=self.get_output_directory())
-                self.append_log("Interrupção solicitada - descartando relatórios...")
-            # Se result is None (Cancelar), não faz nada
+                self.append_log("Interrupção solicitada... Finalizando o arquivo atual.")
         else:
             messagebox.showinfo("Info", "Nenhum processamento em andamento.")
 
@@ -3164,14 +3203,10 @@ class App(tk.Tk):
             total_docs = len(self.analyzer.iniciais_data) + len(self.analyzer.contestacoes_data)
             
             if total_docs > 0:
-                # Há dados analisados, pergunta se deseja gerar relatórios
                 result = messagebox.askyesnocancel(
                     "Encerrar Aplicação",
-                    f"Foram analisados {total_docs} documentos nesta sessão.\n\n"
-                    f"Deseja gerar relatórios de análise antes de sair?\n\n"
-                    f"• Sim: Gera relatórios e fecha a aplicação\n"
-                    f"• Não: Fecha sem gerar relatórios\n"
-                    f"• Cancelar: Continua na aplicação"
+                    f"Foram analisados {total_docs} documentos.\n\n"
+                    f"Deseja gerar os relatórios finais antes de sair?"
                 )
                 
                 if result is True:  # Sim - gerar relatórios
@@ -3181,57 +3216,49 @@ class App(tk.Tk):
                             self.analyzer.clear_backup()  # Remove backup após relatório final
                             messagebox.showinfo(
                                 "Relatórios Gerados", 
-                                f"Relatórios finais salvos com sucesso!\n\n"
-                                f"Local: {self.output_dir.get()}\n"
-                                f"Arquivos: {os.path.basename(json_path)}, {os.path.basename(excel_path)}"
+                                f"Relatórios finais salvos com sucesso em:\n{self.output_dir.get()}"
                             )
                         else:
-                            messagebox.showwarning("Aviso", "Pasta de saída não configurada.\nRelatórios não foram gerados.")
+                            messagebox.showwarning("Aviso", "Pasta de saída não configurada. Relatórios não foram gerados.")
                     except Exception as e:
                         messagebox.showerror("Erro", f"Erro ao gerar relatórios: {str(e)}")
                     
-                    # Fecha a aplicação após gerar (ou tentar gerar) relatórios
                     self.destroy()
                     
                 elif result is False:  # Não - fechar sem relatórios
-                    # Salva backup final antes de sair
                     backup_saved = self.analyzer.save_backup(force=True)
                     if backup_saved:
                         messagebox.showinfo(
                             "Backup Salvo", 
-                            f"💾 Dados salvos em backup!\n\n"
-                            f"Local: {self.analyzer.backup_file}\n\n"
-                            f"Você pode continuar de onde parou na próxima execução."
+                            f"Seu progresso foi salvo em:\n{self.analyzer.backup_file}\n\n"
+                            f"Você pode continuar de onde parou na próxima vez."
                         )
                     self.destroy()
-                    
-                # Se result is None (Cancelar), não faz nada e mantém a aplicação aberta
+                
+                # Se result is None (Cancelar), não faz nada
                 
             else:
-                # Não há dados analisados, fecha normalmente
+                # Não há dados, fecha normalmente
                 if messagebox.askokcancel("Encerrar", "Deseja realmente encerrar a aplicação?"):
                     self.destroy()
                     
         except Exception as e:
-            # Em caso de erro, fecha normalmente
-            messagebox.showerror("Erro", f"Erro inesperado: {str(e)}")
+            messagebox.showerror("Erro", f"Erro inesperado ao fechar: {str(e)}")
             self.destroy()
 
     def start_run(self):
         if not self.input_dir.get() or not os.path.isdir(self.input_dir.get()):
-            messagebox.showwarning("Ops", "Selecione a PASTA DE ENTRADA válida.")
+            messagebox.showwarning("Ops", "Selecione uma PASTA DE ENTRADA válida.")
             return
         if not self.output_dir.get() or not os.path.isdir(self.output_dir.get()):
-            messagebox.showwarning("Ops", "Selecione a PASTA DE SAÍDA válida.")
+            messagebox.showwarning("Ops", "Selecione uma PASTA DE SAÍDA válida.")
             return
         
         # Exibe informações de recuperação se houver
         recovery_info = self.analyzer.get_recovery_info()
         if recovery_info["total_documentos_backup"] > 0:
-            self.append_log(f"🔄 Dados recuperados do backup anterior:")
-            self.append_log(f"   • {recovery_info['total_documentos_backup']} documentos já processados")
-            self.append_log(f"   • Checkpoint: {recovery_info['ultimo_checkpoint']}")
-            self.append_log(f"   • Continuando de onde parou...")
+            self.append_log(f"🔄 Dados recuperados do backup anterior: {recovery_info['total_documentos_backup']} documentos")
+            self.append_log("    Continuando de onde parou...")
         else:
             self.append_log("🆕 Iniciando nova sessão de processamento")
         
@@ -3239,18 +3266,9 @@ class App(tk.Tk):
         self.is_processing = True
         self.should_interrupt = False
         
-        # Controla botões
         self.start_button.configure(state="disabled")
         self.interrupt_button.configure(state="normal")
         
-        # Desabilita outros controles
-        for child in self.winfo_children():
-            try:
-                if child not in [self.interrupt_button]:
-                    child.configure(state="disabled")
-            except Exception:
-                pass
-
         def log_cb(msg):
             self.append_log(msg)
 
@@ -3273,10 +3291,8 @@ class App(tk.Tk):
                 )
                 
                 if self.should_interrupt:
-                    self.append_log("Processamento interrompido.")
-                    self.append_log("Os relatórios de análise foram gerados automaticamente.")
+                    messagebox.showwarning("Interrompido", "Processamento interrompido pelo usuário.")
                 elif excel_path:
-                    self.append_log(f"Arquivo Excel salvo em: {excel_path}")
                     messagebox.showinfo("Concluído", f"Processamento concluído!\n\nPlanilha: {excel_path}\nRelatórios de análise salvos na pasta de saída.")
                 else:
                     messagebox.showwarning("Atenção", "Nenhum arquivo .txt/.pdf encontrado para processar.")
@@ -3285,16 +3301,10 @@ class App(tk.Tk):
                 self.append_log(traceback.format_exc())
                 messagebox.showerror("Erro", str(e))
             finally:
-                # Restaura estado dos controles
                 self.is_processing = False
                 self.should_interrupt = False
                 self.start_button.configure(state="normal")
                 self.interrupt_button.configure(state="disabled")
-                for child in self.winfo_children():
-                    try:
-                        child.configure(state="normal")
-                    except Exception:
-                        pass
 
         self.worker_thread = threading.Thread(target=run_bg, daemon=True)
         self.worker_thread.start()
@@ -3313,4 +3323,15 @@ if __name__ == "__main__":
         outp = input("Pasta de SAÍDA (Excel/JSON): ").strip().strip('"').strip("'")
         rec = input("Recursivo (s/n, padrão s): ").strip().lower()
         recursive = (rec == "" or rec.startswith("s"))
-        process_batch(inp, outp, recursive, log_cb=lambda m: print(m), progress_cb=lambda i,t: print(f"{i}/{t}"))
+        
+        # Instancia o analisador para o modo CLI
+        cli_analyzer = DataAnalyzer(output_dir=outp)
+        
+        process_batch(
+            inp, 
+            outp, 
+            recursive, 
+            log_cb=lambda m: print(m), 
+            progress_cb=lambda i,t: print(f"Progresso: {i}/{t}"),
+            analyzer=cli_analyzer
+        )

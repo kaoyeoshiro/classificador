@@ -6,3 +6,5 @@ openpyxl
 scikit-learn
 numpy
 sentence-transformers
+pytesseract
+Pillow

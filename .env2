@@ -1,5 +1,0 @@
-OPENROUTER_API_KEY=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
-OPENROUTER_MODEL=openai/gpt-5-nano
-OPENROUTER_BASE=https://openrouter.ai/api/v1
-APP_TITLE=Classificador PGE-MS
-

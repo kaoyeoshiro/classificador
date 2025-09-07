@@ -50,6 +50,7 @@ logs/
 
 # Environment variables
 .env
+.env2
 .env.local
 .env.*.local
 
